@@ -1,0 +1,8 @@
+node_modules
+dist
+docs
+coverage
+.vscode
+.idea
+.env.test
+.env
