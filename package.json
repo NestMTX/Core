@@ -42,7 +42,9 @@
   "dependencies": {
     "@nestmtx/config": "^1.0.8",
     "@nestmtx/pando-logger": "^1.0.1",
+    "@nestmtx/socket-server": "^1.0.1",
     "dotenv": "^16.3.1",
+    "execa": "^8.0.1",
     "knex": "^3.1.0",
     "mssql": "^10.0.1",
     "mysql2": "^3.7.0",
