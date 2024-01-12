@@ -6,7 +6,7 @@ const connections: Record<string, Knex.Config> = {
   sqlite: {
     client: 'sqlite',
     connection: {
-      filename: join(Env.get('NESTMTX_TMP_DIR', '/tmp'), 'nestmtx.sqlite'),
+      filename: join(Env.get('NESTMTX_TMP_DIR', '/tmp'), 'db.sqlite3'),
     },
     pool: {
       afterCreate: (conn, cb) => {

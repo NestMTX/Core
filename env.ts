@@ -3,6 +3,7 @@ import { Env } from '@nestmtx/config'
 import Joi from 'joi'
 
 const schema: EnvSchema = {
+  APP_KEY: Joi.string().required().min(32),
   NESTMTX_SOCKET_PATH: Joi.string().required(),
   NESTMTX_PROCESS_SOCKET_PATH: Joi.string().required(),
   NESTMTX_TMP_DIR: Joi.string().required(),
