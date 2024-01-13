@@ -24,3 +24,23 @@ export const getCameras = async (app: ApplicationInterface) => {
     is_demanded: !!camera.is_demanded,
   }))
 }
+
+export const getCamera = async (app: ApplicationInterface, id: number) => {
+  const tableExists = await app.db.schema.hasTable('cameras')
+  if (!tableExists) {
+    return undefined
+  }
+  const fromDb = await app.db('cameras').where('id', id).first()
+  if (!fromDb) {
+    return undefined
+  }
+  return {
+    ...fromDb,
+    is_active: !!fromDb.is_active,
+    is_ready: !!fromDb.is_ready,
+    is_demanded: !!fromDb.is_demanded,
+    uid: fromDb.uid ? app.encryption.decrypt(fromDb.uid) : null,
+    info: fromDb.info ? app.encryption.decrypt(fromDb.info) : null,
+    stream_info: fromDb.info ? app.encryption.decrypt(fromDb.stream_info) : null,
+  }
+}

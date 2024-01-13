@@ -47,9 +47,37 @@ class Application extends EventEmitter implements ApplicationInterface {
 
   public async stop() {
     this.logger.info('Stopping application')
+    const handleError = (error: unknown) => {
+      const isOk = (message: string) => ['aborted'].some((code) => message.includes(code))
+      if (error instanceof Error) {
+        if (!isOk(error.message)) {
+          throw error
+        }
+      } else if ('string' === typeof error) {
+        if (!isOk(error)) {
+          throw new Error(error)
+        }
+      } else {
+        throw error
+      }
+    }
     await Promise.all([
-      this.api.stop(),
-      this.db.destroy(),
+      new Promise((resolve) =>
+        this.api
+          .stop()
+          .then(resolve, (reason) => {
+            handleError(reason)
+          })
+          .catch(handleError)
+      ),
+      new Promise((resolve) =>
+        this.db
+          .destroy()
+          .then(resolve, (reason) => {
+            handleError(reason)
+          })
+          .catch(handleError)
+      ),
       this.cron.stop(),
       new Promise((resolve) => {
         this.logger.once('finish', resolve)

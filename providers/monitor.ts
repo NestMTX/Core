@@ -1,10 +1,14 @@
 import make from '@nestmtx/pando-logger'
-import { getCameras } from '../app/utilities'
+import type { Logger } from 'winston'
+import { getCamera, getCameras } from '../app/utilities'
 import type { ApplicationInterface } from '../contracts/application'
 import type { ProviderInterface } from '../contracts/provider'
 
 const useMonitoring: ProviderInterface = (app: ApplicationInterface) => {
   const monitoringLogger = make('core:monitoring')
+  const monitoringCleanupLogger = make('core:monitoring:cleanup')
+  const monitoringStartupLogger = make('core:monitoring:startup')
+  const monitoringShutdownLogger = make('core:monitoring:shutdown')
   let heartbeatIsWorking = false
   let heartbeatSkipCount = 0
   let lastHeartbeatAt = 0
@@ -40,7 +44,7 @@ const useMonitoring: ProviderInterface = (app: ApplicationInterface) => {
         camera.mediamtx_path.length > 0 &&
         camera.is_active === true &&
         camera.startup_mode !== 'never' &&
-        (camera.startup_mode === 'always' || camera.is_demanded === true)
+        (camera.startup_mode === 'always_on' || camera.is_demanded === true)
       if (cameraShouldBeLive) {
         if (!app.processes.has(camera.id)) {
           shouldBeLive.add(camera.id)
@@ -54,10 +58,67 @@ const useMonitoring: ProviderInterface = (app: ApplicationInterface) => {
         }
       }
     })
-    monitoringLogger.debug('Camera Status Heartbeat Finished')
+    /* Do the actions for each of the cameras which need to be cleaned up, started, or stopped */
+    const promises: Promise<void>[] = [] // @todo add type for execa process
+    shouldBeCleaned.forEach((cameraId) =>
+      promises.push(cleanCamera(app, cameraId, monitoringCleanupLogger))
+    )
+    shouldBeLive.forEach((cameraId) =>
+      promises.push(startCamera(app, cameraId, monitoringStartupLogger))
+    )
+    shouldBeDead.forEach((cameraId) =>
+      promises.push(stopCamera(app, cameraId, monitoringShutdownLogger))
+    )
+    /* Wait for all of the actions to complete */
+    await Promise.all(promises)
+    const finishTime = Date.now()
+    const elapsed = finishTime - now
+    monitoringLogger.debug(`Camera Status Heartbeat Finished in ${elapsed}ms`)
     heartbeatIsWorking = false
   })
-  app.on('termination', monitoringLogger.end.bind(monitoringLogger))
+  app.on('termination', async () => {
+    monitoringLogger.info('Shutting down all running camerea processes')
+    const cameras = await getCameras(app)
+    const promises: Promise<void>[] = []
+    cameras.forEach((camera) => {
+      if (app.processes.has(camera.id)) {
+        promises.push(stopCamera(app, camera.id, monitoringShutdownLogger))
+      }
+    })
+    await Promise.all(promises)
+    monitoringLogger.end()
+    monitoringCleanupLogger.end()
+    monitoringStartupLogger.end()
+    monitoringShutdownLogger.end()
+  })
+}
+
+const cleanCamera = async (app: ApplicationInterface, cameraId: number, logger: Logger) => {
+  logger.info(`Cleaning up database record for camera ${cameraId}`)
+  await app.db('cameras').where('id', cameraId).update({
+    is_ready: false,
+    child_process_id: null,
+  })
+  logger.info(`Database record for camera ${cameraId} cleaned up`)
+  app.emit('camera:db:updated', cameraId)
+}
+
+const startCamera = async (app: ApplicationInterface, cameraId: number, logger: Logger) => {
+  logger.info(`Trying to start camera #${cameraId}`)
+  const camera = await getCamera(app, cameraId)
+  if (!camera) {
+    logger.warn(`Camera #${cameraId} not found`)
+    return
+  }
+  logger.info(`Starting camera ${cameraId}`)
+  // @todo: actually start the camera
+  app.emit('camera:db:updated', cameraId)
+}
+
+const stopCamera = async (app: ApplicationInterface, cameraId: number, logger: Logger) => {
+  logger.info(`Stopping camera ${cameraId}`)
+  // @todo: actually stop the camera
+  app.emit('camera:db:updated', cameraId)
 }
 
 export default useMonitoring

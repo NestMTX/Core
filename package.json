@@ -41,6 +41,7 @@
   },
   "dependencies": {
     "@jakguru/milicron": "^1.0.0",
+    "@lukeed/ms": "^2.0.2",
     "@nestmtx/config": "^1.0.8",
     "@nestmtx/pando-logger": "^1.0.1",
     "@nestmtx/socket-server": "^1.0.2",
@@ -51,6 +52,8 @@
     "mysql2": "^3.7.0",
     "pg": "^8.11.3",
     "reflect-metadata": "^0.2.1",
+    "safe-stable-stringify": "^2.4.3",
+    "secure-json-parse": "^2.7.0",
     "source-map-support": "^0.5.21",
     "sqlite3": "^5.1.7"
   },
