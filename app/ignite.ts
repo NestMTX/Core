@@ -7,8 +7,12 @@ import type { Knex } from 'knex'
 import knex from 'knex'
 import { inspect } from 'util'
 import type { Logger } from 'winston'
-import type { ApplicationInterface } from '../contracts/application'
+import type { ApplicationInterface, Overlays } from '../contracts/application'
 import Encryption from './services/encryption'
+import { getExecaModule } from './esModules'
+import type { ExecaModule } from './esModules'
+import { makeOverlayImage } from './services/overlays'
+import { pickPort } from 'pick-port'
 
 class Application extends EventEmitter implements ApplicationInterface {
   public readonly db: Knex
@@ -19,6 +23,9 @@ class Application extends EventEmitter implements ApplicationInterface {
   public readonly env: Env
   public readonly cron: MiliCron
   public readonly encryption: Encryption
+  public readonly execa: ExecaModule
+  public readonly pickPort: typeof pickPort
+  public readonly overlays: Overlays
 
   constructor(
     config: Config,
@@ -26,7 +33,9 @@ class Application extends EventEmitter implements ApplicationInterface {
     api: SocketServer,
     logger: Logger,
     env: Env,
-    encryption: Encryption
+    encryption: Encryption,
+    execa: ExecaModule,
+    overlays: Overlays
   ) {
     super()
     this.config = config
@@ -37,9 +46,13 @@ class Application extends EventEmitter implements ApplicationInterface {
     this.env = env
     this.cron = new MiliCron()
     this.encryption = encryption
+    this.execa = execa
+    this.overlays = overlays
+    this.pickPort = pickPort
   }
 
   public async start() {
+    /* Start the application */
     this.logger.info('Starting application')
     await Promise.all([this.api.start(), this.cron.start()])
     return this
@@ -127,7 +140,33 @@ export default async function ignite(config: Config) {
   })
   const appLogger = make('core')
   const encryption = new Encryption(config.get('encryption.secret'))
-  const app = new Application(config, db, apiSocket, appLogger, Env, encryption)
+  const execa = await getExecaModule()
+  const overlays: Overlays = {
+    initializing: await makeOverlayImage({
+      title: 'Camera Initializing',
+      text: 'Your feed will start soon',
+    }),
+    disabled: await makeOverlayImage({
+      title: 'Camera Disabled',
+    }),
+    disconnected: await makeOverlayImage({
+      title: 'Camera Disconnected',
+      text: 'Your feed has been interrupted. It will be restarted as soon as possible',
+    }),
+    offline: await makeOverlayImage({
+      title: 'Camera Offline',
+    }),
+    live: await makeOverlayImage({
+      title: '',
+      background: { r: 0, g: 0, b: 0, a: 0 },
+      foreground: { r: 0, g: 0, b: 0, a: 0 },
+    }),
+    missing: await makeOverlayImage({
+      title: 'No Camera Found',
+      text: 'The camera you are looking for is not available. Please check the stream URL and try again.',
+    }),
+  }
+  const app = new Application(config, db, apiSocket, appLogger, Env, encryption, execa, overlays)
   app.on('terminated', () => {
     apiSocketLogger.end()
   })

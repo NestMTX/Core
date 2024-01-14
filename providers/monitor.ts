@@ -1,17 +1,59 @@
 import make from '@nestmtx/pando-logger'
+import { constants } from 'fs/promises'
+import { dirname } from 'path'
 import type { Logger } from 'winston'
-import { getCamera, getCameras } from '../app/utilities'
+import { getCamera, getCameras, fsExists } from '../app/utilities'
 import type { ApplicationInterface } from '../contracts/application'
 import type { ProviderInterface } from '../contracts/provider'
+import type { Socket as DGramSocket } from 'dgram'
+import { createSocket } from 'dgram'
+import { pickPort } from 'pick-port'
 
+/**
+ * The Monitoring Provider is responsible for managing the camera processes.
+ */
 const useMonitoring: ProviderInterface = (app: ApplicationInterface) => {
   const monitoringLogger = make('core:monitoring')
   const monitoringCleanupLogger = make('core:monitoring:cleanup')
   const monitoringStartupLogger = make('core:monitoring:startup')
   const monitoringShutdownLogger = make('core:monitoring:shutdown')
+  const overlayPortToCameraMap = new Map<number, number | undefined>()
+  const overlayCameraToSocketMap = new Map<number, DGramSocket>()
+  const getOverlayCameraPort = (cameraId: number) => {
+    const port = Array.from(overlayPortToCameraMap.keys()).find(
+      (port) => overlayPortToCameraMap.get(port) === cameraId
+    )
+    return port
+  }
+  const ensureOverlayDgramSocket = async (cameraId: number) => {
+    if (overlayCameraToSocketMap.has(cameraId)) {
+      return overlayCameraToSocketMap.get(cameraId)!
+    }
+    let port = await pickPort({
+      type: 'udp',
+      ip: '0.0.0.0',
+      reserveTimeout: 15,
+    })
+    while (overlayPortToCameraMap.has(port) && overlayPortToCameraMap.get(port) !== cameraId) {
+      port = await pickPort({
+        type: 'udp',
+        ip: '0.0.0.0',
+        reserveTimeout: 15,
+      })
+    }
+    const socket = createSocket('udp4')
+    overlayPortToCameraMap.set(port, cameraId)
+    overlayCameraToSocketMap.set(cameraId, socket)
+    return socket
+  }
+
   let heartbeatIsWorking = false
   let heartbeatSkipCount = 0
   let lastHeartbeatAt = 0
+  /**
+   * The Heartbeat is a cron job which runs every second.
+   * It checks the status of each camera and starts or stops the camera processes as needed.
+   */
   app.cron.$on('* * * * * *', async () => {
     if (heartbeatIsWorking) {
       heartbeatSkipCount++
@@ -64,7 +106,15 @@ const useMonitoring: ProviderInterface = (app: ApplicationInterface) => {
       promises.push(cleanCamera(app, cameraId, monitoringCleanupLogger))
     )
     shouldBeLive.forEach((cameraId) =>
-      promises.push(startCamera(app, cameraId, monitoringStartupLogger))
+      promises.push(
+        startCamera(
+          app,
+          cameraId,
+          monitoringStartupLogger,
+          ensureOverlayDgramSocket(cameraId),
+          getOverlayCameraPort(cameraId)
+        )
+      )
     )
     shouldBeDead.forEach((cameraId) =>
       promises.push(stopCamera(app, cameraId, monitoringShutdownLogger))
@@ -76,6 +126,113 @@ const useMonitoring: ProviderInterface = (app: ApplicationInterface) => {
     monitoringLogger.debug(`Camera Status Heartbeat Finished in ${elapsed}ms`)
     heartbeatIsWorking = false
   })
+  let overlayerIsWorking = false
+  let overlayerSkipCount = 0
+  let lastOverlayerAt = 0
+  /**
+   * The Camera Overlayer is a cron job which runs every 200ms.
+   * It checks the status of each camera and writes the appropriate overlay to the named pipe.
+   * It pushes overlays at a rate of 5fps, which should be sufficient to keep the gstreamer pipeline alive.
+   */
+  app.cron.$on('*/200 * * * * * *', async () => {
+    if (overlayerIsWorking) {
+      overlayerSkipCount++
+      if (overlayerSkipCount > 60) {
+        monitoringLogger.error('Camera Overlayer Heartbeat Failed. Killing core to force restart.')
+        process.exit(1)
+      }
+      return
+    }
+    const now = Date.now()
+    if (lastOverlayerAt > 0) {
+      const elapsed = now - lastOverlayerAt
+      monitoringLogger.debug(`Time since Last Camera Overlayer Heartbeat: ${elapsed}ms`)
+    }
+    lastOverlayerAt = now
+    overlayerIsWorking = true
+    overlayerSkipCount = 0
+    monitoringLogger.debug('Camera Overlayer Started')
+    const cameras = await getCameras(app)
+    /* Ensure that there are dgram sockets for the overlays for each camera */
+    monitoringLogger.debug('Ensuring that dgram sockets exist for overlays')
+    await Promise.all(cameras.map((camera) => ensureOverlayDgramSocket(camera.id)))
+    /* Separate each status into its own silo */
+    monitoringLogger.debug('Separating cameras into silos')
+    const camerasInitializing = new Set<number>()
+    const camerasDisabled = new Set<number>()
+    const camerasDisconnected = new Set<number>()
+    const camerasOffline = new Set<number>()
+    const camerasLive = new Set<number>()
+    cameras.forEach((camera) => {
+      switch (true) {
+        case camera.startup_mode === 'never':
+          camerasDisabled.add(camera.id)
+          break
+        case camera.is_active === false:
+          camerasDisabled.add(camera.id)
+          break
+        case camera.is_active === true && camera.child_process_id === null:
+          camerasInitializing.add(camera.id)
+          break
+        case camera.is_active === true && camera.child_process_id !== null && !camera.is_ready:
+          camerasDisconnected.add(camera.id)
+          break
+        case camera.is_active === true &&
+          camera.child_process_id !== null &&
+          camera.is_ready &&
+          app.processes.has(camera.id):
+          camerasLive.add(camera.id)
+          break
+        default:
+          camerasOffline.add(camera.id)
+          break
+      }
+    })
+    /* Write the overlays for each camera to the appropriate dgram socket */
+    monitoringLogger.debug('Writing overlays to dgram sockets')
+    const promises: Promise<void>[] = []
+    const sendOverlayToSocket = async (cameraId: number, overlay: Buffer) => {
+      const socket = overlayCameraToSocketMap.get(cameraId)
+      const port = getOverlayCameraPort(cameraId)
+      if (socket && port) {
+        await new Promise((resolve) => {
+          socket.send(overlay, port, 'localhost', (error, bytes) => {
+            if (error) {
+              monitoringLogger.error(
+                `Failed to send overlay to socket for camera ${cameraId} with error: ${error.message}`
+              )
+            }
+            return resolve(bytes)
+          })
+        })
+      } else {
+        monitoringLogger.error(`Socket or port for camera ${cameraId} not found`)
+      }
+    }
+    camerasInitializing.forEach((cameraId) =>
+      promises.push(sendOverlayToSocket(cameraId, app.overlays.initializing))
+    )
+    camerasDisabled.forEach((cameraId) =>
+      promises.push(sendOverlayToSocket(cameraId, app.overlays.disabled))
+    )
+    camerasDisconnected.forEach((cameraId) =>
+      promises.push(sendOverlayToSocket(cameraId, app.overlays.disconnected))
+    )
+    camerasOffline.forEach((cameraId) =>
+      promises.push(sendOverlayToSocket(cameraId, app.overlays.offline))
+    )
+    camerasLive.forEach((cameraId) =>
+      promises.push(sendOverlayToSocket(cameraId, app.overlays.live))
+    )
+    await Promise.all(promises)
+    const finishTime = Date.now()
+    const elapsed = finishTime - now
+    monitoringLogger.debug(`Camera Overlayer Finished in ${elapsed}ms`)
+    overlayerIsWorking = false
+  })
+  /**
+   * When the application is terminated, we need to shut down all of the camera and logger processes.
+   */
   app.on('termination', async () => {
     monitoringLogger.info('Shutting down all running camerea processes')
     const cameras = await getCameras(app)
@@ -93,6 +250,9 @@ const useMonitoring: ProviderInterface = (app: ApplicationInterface) => {
   })
 }
 
+/**
+ * Clean up the database record for a camera.
+ */
 const cleanCamera = async (app: ApplicationInterface, cameraId: number, logger: Logger) => {
   logger.info(`Cleaning up database record for camera ${cameraId}`)
   await app.db('cameras').where('id', cameraId).update({
@@ -103,11 +263,29 @@ const cleanCamera = async (app: ApplicationInterface, cameraId: number, logger: 
   app.emit('camera:db:updated', cameraId)
 }
 
-const startCamera = async (app: ApplicationInterface, cameraId: number, logger: Logger) => {
+/**
+ * Start a camera gstreamer process.
+ */
+const startCamera = async (
+  app: ApplicationInterface,
+  cameraId: number,
+  logger: Logger,
+  overlayDgramSocketPromise: Promise<DGramSocket | undefined>,
+  overlayDgramSocektPort: number | undefined
+) => {
   logger.info(`Trying to start camera #${cameraId}`)
   const camera = await getCamera(app, cameraId)
   if (!camera) {
     logger.warn(`Camera #${cameraId} not found`)
+    return
+  }
+  const overlayDgramSocket = await overlayDgramSocketPromise
+  if (!overlayDgramSocket) {
+    logger.warn(`Overlay Dgram Socket for camera #${cameraId} not found`)
+    return
+  }
+  if (!overlayDgramSocektPort) {
+    logger.warn(`Overlay Dgram Socket Port for camera #${cameraId} not found`)
     return
   }
   logger.info(`Starting camera ${cameraId}`)
@@ -115,10 +293,52 @@ const startCamera = async (app: ApplicationInterface, cameraId: number, logger: 
   app.emit('camera:db:updated', cameraId)
 }
 
+/**
+ * Stop a camera gstreamer process.
+ */
 const stopCamera = async (app: ApplicationInterface, cameraId: number, logger: Logger) => {
   logger.info(`Stopping camera ${cameraId}`)
   // @todo: actually stop the camera
   app.emit('camera:db:updated', cameraId)
+}
+
+/**
+ * Ensure that a named pipe exists, or create it if it doesn't.
+ */
+const ensureNamedPipe = async (
+  app: ApplicationInterface,
+  path: string,
+  refresh: boolean = false
+) => {
+  const exists = await fsExists(path, constants.F_OK | constants.W_OK)
+  if (!exists) {
+    const { execa } = app.execa
+    const dir = dirname(path)
+    const dirExists = await fsExists(dir, constants.F_OK | constants.W_OK)
+    if (!dirExists) {
+      const result = await execa('mkdir', ['-p', dir], {
+        reject: false,
+      })
+      if (result.failed) {
+        throw new Error(`Failed to create named pipe directory with error: ${result.stderr}`)
+      }
+    }
+    const result = await execa('mkfifo', [path], {
+      reject: false,
+    })
+    if (result.failed) {
+      throw new Error(`Failed to create named pipe with error: ${result.stderr}`)
+    }
+  } else if (refresh === true) {
+    const { execa } = app.execa
+    const result = await execa('rm', [path], {
+      reject: false,
+    })
+    if (result.failed) {
+      throw new Error(`Failed to remove named pipe with error: ${result.stderr}`)
+    }
+    await ensureNamedPipe(app, path)
+  }
 }
 
 export default useMonitoring

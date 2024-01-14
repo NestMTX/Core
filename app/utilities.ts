@@ -1,4 +1,5 @@
 import type { ApplicationInterface } from '../contracts/application'
+import { access, constants } from 'fs/promises'
 
 export const getCameras = async (app: ApplicationInterface) => {
   const tableExists = await app.db.schema.hasTable('cameras')
@@ -42,5 +43,14 @@ export const getCamera = async (app: ApplicationInterface, id: number) => {
     uid: fromDb.uid ? app.encryption.decrypt(fromDb.uid) : null,
     info: fromDb.info ? app.encryption.decrypt(fromDb.info) : null,
     stream_info: fromDb.info ? app.encryption.decrypt(fromDb.stream_info) : null,
+  }
+}
+
+export const fsExists = async (path: string, mode?: number) => {
+  try {
+    await access(path, mode ?? constants.F_OK)
+    return true
+  } catch {
+    return false
   }
 }
