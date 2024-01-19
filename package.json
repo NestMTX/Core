@@ -49,6 +49,7 @@
     "canvas": "^2.11.2",
     "dotenv": "^16.3.1",
     "execa": "^8.0.1",
+    "fluent-ffmpeg": "^2.1.2",
     "knex": "^3.1.0",
     "mssql": "^10.0.1",
     "mysql2": "^3.7.0",
@@ -58,7 +59,8 @@
     "safe-stable-stringify": "^2.4.3",
     "secure-json-parse": "^2.7.0",
     "source-map-support": "^0.5.21",
-    "sqlite3": "^5.1.7"
+    "sqlite3": "^5.1.7",
+    "uuid": "^9.0.1"
   },
   "engines": {
     "node": ">=18.0.0"

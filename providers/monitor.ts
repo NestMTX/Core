@@ -5,9 +5,9 @@ import type { Logger } from 'winston'
 import { getCamera, getCameras, fsExists } from '../app/utilities'
 import type { ApplicationInterface } from '../contracts/application'
 import type { ProviderInterface } from '../contracts/provider'
-import type { Socket as DGramSocket } from 'dgram'
-import { createSocket } from 'dgram'
+import SocketServer from '../app/services/socket'
 import { pickPort } from 'pick-port'
+import { OverlayStreamer } from '../app/services/overlays'
 
 /**
  * The Monitoring Provider is responsible for managing the camera processes.
@@ -18,33 +18,45 @@ const useMonitoring: ProviderInterface = (app: ApplicationInterface) => {
   const monitoringStartupLogger = make('core:monitoring:startup')
   const monitoringShutdownLogger = make('core:monitoring:shutdown')
   const overlayPortToCameraMap = new Map<number, number | undefined>()
-  const overlayCameraToSocketMap = new Map<number, DGramSocket>()
+  const overlayCameraToSocketMap = new Map<number, SocketServer>()
+  const overlayCameraToOverlayStreamerMap = new Map<number, OverlayStreamer>()
   const getOverlayCameraPort = (cameraId: number) => {
     const port = Array.from(overlayPortToCameraMap.keys()).find(
       (port) => overlayPortToCameraMap.get(port) === cameraId
     )
     return port
   }
-  const ensureOverlayDgramSocket = async (cameraId: number) => {
+  const ensureOverlaySocket = async (cameraId: number) => {
     if (overlayCameraToSocketMap.has(cameraId)) {
       return overlayCameraToSocketMap.get(cameraId)!
     }
     let port = await pickPort({
-      type: 'udp',
+      type: 'tcp',
       ip: '0.0.0.0',
       reserveTimeout: 15,
     })
     while (overlayPortToCameraMap.has(port) && overlayPortToCameraMap.get(port) !== cameraId) {
       port = await pickPort({
-        type: 'udp',
+        type: 'tcp',
         ip: '0.0.0.0',
         reserveTimeout: 15,
       })
     }
-    const socket = createSocket('udp4')
+    const socket: SocketServer = new SocketServer(port)
     overlayPortToCameraMap.set(port, cameraId)
     overlayCameraToSocketMap.set(cameraId, socket)
     return socket
+  }
+  const ensureOverlayStreamer = async (cameraId: number) => {
+    let streamer: OverlayStreamer | undefined
+    if (!overlayCameraToOverlayStreamerMap.has(cameraId)) {
+      const overlaySocket = await ensureOverlaySocket(cameraId)
+      streamer = new OverlayStreamer(cameraId, app.execa, overlaySocket)
+      overlayCameraToOverlayStreamerMap.set(cameraId, streamer)
+    } else {
+      streamer = overlayCameraToOverlayStreamerMap.get(cameraId)
+    }
+    return streamer
   }
 
   let heartbeatIsWorking = false
@@ -59,6 +71,7 @@ const useMonitoring: ProviderInterface = (app: ApplicationInterface) => {
       heartbeatSkipCount++
       if (heartbeatSkipCount > 60) {
         monitoringLogger.error('Camera Status Heartbeat Failed. Killing core to force restart.')
+        console.error('Camera Status Heartbeat Failed. Killing core to force restart.')
         process.exit(1)
       }
       return
@@ -111,7 +124,7 @@ const useMonitoring: ProviderInterface = (app: ApplicationInterface) => {
           app,
           cameraId,
           monitoringStartupLogger,
-          ensureOverlayDgramSocket(cameraId),
+          ensureOverlayStreamer(cameraId),
           getOverlayCameraPort(cameraId)
         )
       )
@@ -134,7 +147,7 @@ const useMonitoring: ProviderInterface = (app: ApplicationInterface) => {
    * It checks the status of each camera and writes the appropriate overlay to the named pipe.
    * It pushes overlays at a rate of 5fps, which should be sufficient to keep the gstreamer pipeline alive.
    */
-  app.cron.$on('*/200 * * * * * *', async () => {
+  app.cron.$on('* * * * * *', async () => {
     if (overlayerIsWorking) {
       overlayerSkipCount++
       if (overlayerSkipCount > 60) {
@@ -153,9 +166,9 @@ const useMonitoring: ProviderInterface = (app: ApplicationInterface) => {
     overlayerSkipCount = 0
     monitoringLogger.debug('Camera Overlayer Started')
     const cameras = await getCameras(app)
-    /* Ensure that there are dgram sockets for the overlays for each camera */
-    monitoringLogger.debug('Ensuring that dgram sockets exist for overlays')
-    await Promise.all(cameras.map((camera) => ensureOverlayDgramSocket(camera.id)))
+    /* Ensure that there are sockets for the overlays for each camera */
+    monitoringLogger.debug('Ensuring that sockets exist for overlays')
+    await Promise.all(cameras.map((camera) => ensureOverlaySocket(camera.id)))
     /* Separate each status into its own silo */
     monitoringLogger.debug('Separating cameras into silos')
     const camerasInitializing = new Set<number>()
@@ -188,25 +201,16 @@ const useMonitoring: ProviderInterface = (app: ApplicationInterface) => {
           break
       }
     })
-    /* Write the overlays for each camera to the appropriate dgram socket */
-    monitoringLogger.debug('Writing overlays to dgram sockets')
+    /* Write the overlays for each camera to the appropriate socket */
+    monitoringLogger.debug('Writing overlays to sockets')
     const promises: Promise<void>[] = []
     const sendOverlayToSocket = async (cameraId: number, overlay: Buffer) => {
-      const socket = overlayCameraToSocketMap.get(cameraId)
-      const port = getOverlayCameraPort(cameraId)
-      if (socket && port) {
-        await new Promise((resolve) => {
-          socket.send(overlay, port, 'localhost', (error, bytes) => {
-            if (error) {
-              monitoringLogger.error(
-                `Failed to send overlay to socket for camera ${cameraId} with error: ${error.message}`
-              )
-            }
-            return resolve(bytes)
-          })
-        })
+      // const streamer = overlayCameraToOverlayStreamerMap.get(cameraId)
+      const streamer = await ensureOverlayStreamer(cameraId)
+      if (streamer) {
+        await streamer.write(overlay)
       } else {
-        monitoringLogger.error(`Socket or port for camera ${cameraId} not found`)
+        monitoringLogger.error(`Overlay streamer for camera ${cameraId} not found`)
       }
     }
     camerasInitializing.forEach((cameraId) =>
@@ -242,6 +246,9 @@ const useMonitoring: ProviderInterface = (app: ApplicationInterface) => {
         promises.push(stopCamera(app, camera.id, monitoringShutdownLogger))
       }
     })
+    overlayCameraToOverlayStreamerMap.forEach((streamer) => {
+      promises.push(streamer.shutdown())
+    })
     await Promise.all(promises)
     monitoringLogger.end()
     monitoringCleanupLogger.end()
@@ -270,22 +277,22 @@ const startCamera = async (
   app: ApplicationInterface,
   cameraId: number,
   logger: Logger,
-  overlayDgramSocketPromise: Promise<DGramSocket | undefined>,
-  overlayDgramSocektPort: number | undefined
+  overlayStreamerPromise: Promise<OverlayStreamer | undefined>,
+  overlaySocektPort: number | undefined
 ) => {
   logger.info(`Trying to start camera #${cameraId}`)
   const camera = await getCamera(app, cameraId)
   if (!camera) {
-    logger.warn(`Camera #${cameraId} not found`)
+    logger.warning(`Camera #${cameraId} not found`)
     return
   }
-  const overlayDgramSocket = await overlayDgramSocketPromise
-  if (!overlayDgramSocket) {
-    logger.warn(`Overlay Dgram Socket for camera #${cameraId} not found`)
+  const overlayStreamer = await overlayStreamerPromise
+  if (!overlayStreamer) {
+    logger.warning(`Overlay Streamer for camera #${cameraId} not found`)
     return
   }
-  if (!overlayDgramSocektPort) {
-    logger.warn(`Overlay Dgram Socket Port for camera #${cameraId} not found`)
+  if (!overlaySocektPort) {
+    logger.warning(`Overlay Socket Port for camera #${cameraId} not found`)
     return
   }
   logger.info(`Starting camera ${cameraId}`)

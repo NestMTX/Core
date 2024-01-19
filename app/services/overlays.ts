@@ -1,6 +1,11 @@
 import { createCanvas, registerFont } from 'canvas'
 import { readdir } from 'fs/promises'
 import { join } from 'path'
+import type { ExecaModule } from '../esModules'
+import type { Logger } from 'winston'
+import make from '@nestmtx/pando-logger'
+import type SocketServer from './socket'
+import type { ExecaChildProcess } from 'execa'
 
 export interface Color {
   r: number
@@ -85,6 +90,74 @@ export const makeOverlayImage = async (options: MakeOverlayImageOptions) => {
     ctx.font = `${config.textSize}px "NotoSansDisplay"`
     ctx.fillText(config.text, config.width / 2, config.height / 2 + config.titleSize)
   }
-  // Return the Buffer
+  // Return the Image Buffer
   return canvas.toBuffer('image/png')
+}
+
+export class OverlayStreamer {
+  readonly #logger: Logger
+  readonly #execa: ExecaModule
+  readonly #server: SocketServer
+  #process?: ExecaChildProcess
+  #abortController: AbortController
+
+  constructor(cameraId: number, execa: ExecaModule, server: SocketServer) {
+    this.#logger = make(`core:camera:${cameraId}:overlay`)
+    this.#execa = execa
+    this.#server = server
+    this.#abortController = new AbortController()
+  }
+
+  public async write(packet: Buffer) {
+    this.#logger.debug('Starting the ffmpeg process')
+    if (!this.#process || !this.#process.stdin || !this.#process.stdin.writable) {
+      this.#process = this.#execa.execa(
+        'ffmpeg',
+        [
+          '-f',
+          'image2pipe',
+          '-i',
+          '-',
+          '-c:v',
+          'libx264',
+          '-f',
+          'mpegts',
+          '-movflags',
+          'frag_keyframe+empty_moov',
+          '-max_packet_size',
+          '1300',
+          'pipe:1',
+        ],
+        {
+          signal: this.#abortController.signal,
+          stdout: 'pipe',
+          input: packet,
+        }
+      )
+      if (!this.#process || !this.#process.stdin || !this.#process.stdout) {
+        this.#logger.error('Failed to start ffmpeg process')
+        return
+      }
+      this.#process.stdout.on('data', (retPacket) => {
+        this.#logger.debug(`Pushing buffer with size ${retPacket.length} to socket server`)
+        this.#server.broadcast(retPacket)
+      })
+      this.#process
+        .then(() => {
+          this.#process = undefined
+        })
+        .catch((err) => {
+          this.#logger.error(err)
+          this.#process = undefined
+        })
+    } else {
+      this.#logger.debug(`Pushing buffer with size ${packet.length} to ffmpeg process`)
+      this.#process.stdin.write(packet)
+    }
+  }
+
+  public async shutdown() {
+    this.#abortController.abort()
+    await Promise.all([this.#server.close()])
+  }
 }

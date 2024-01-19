@@ -44,8 +44,10 @@ Config.initialize(join(base, 'config'))
     const logger = make('core:initialization')
     if (error instanceof EnvSchemaValidationError && error.messages) {
       logger.crit(error.message + ':\n\n' + error.messages.join('\n'))
+      console.error(error.message + ':\n\n' + error.messages.join('\n'))
     } else {
       logger.crit(error.stack)
+      console.error(error.stack)
     }
     logger.once('finish', () => process.exit(1))
     setTimeout(() => logger.end(), 500)
