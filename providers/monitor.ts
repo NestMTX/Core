@@ -1,8 +1,6 @@
 import make from '@nestmtx/pando-logger'
-import { constants } from 'fs/promises'
-import { dirname } from 'path'
 import type { Logger } from 'winston'
-import { getCamera, getCameras, fsExists } from '../app/utilities'
+import { getCamera, getCameras } from '../app/utilities'
 import type { ApplicationInterface } from '../contracts/application'
 import type { ProviderInterface } from '../contracts/provider'
 import SocketServer from '../app/services/socket'
@@ -145,9 +143,9 @@ const useMonitoring: ProviderInterface = (app: ApplicationInterface) => {
   /**
    * The Camera Overlayer is a cron job which runs every 200ms.
    * It checks the status of each camera and writes the appropriate overlay to the named pipe.
-   * It pushes overlays at a rate of 5fps, which should be sufficient to keep the gstreamer pipeline alive.
+   * It pushes overlays at a rate of 5fps, which should be sufficient to keep the ffmpeg pipeline alive.
    */
-  app.cron.$on('* * * * * *', async () => {
+  app.cron.$on('*/200 * * * * * *', async () => {
     if (overlayerIsWorking) {
       overlayerSkipCount++
       if (overlayerSkipCount > 60) {
@@ -286,17 +284,63 @@ const startCamera = async (
     logger.warning(`Camera #${cameraId} not found`)
     return
   }
+  if (!camera.info) {
+    logger.warning(`Camera #${cameraId} is missing required information to be started.`)
+    logger.notice(`Removing camera #${cameraId} from startable cameras.`)
+    await app.db('cameras').where('id', cameraId).update({
+      is_active: false,
+      is_ready: false,
+      child_process_id: null,
+    })
+    return
+  }
+  if (camera.child_process_id !== null) {
+    logger.notice(`Camera #${cameraId} appears to have already been started.`)
+    return
+  }
   const overlayStreamer = await overlayStreamerPromise
   if (!overlayStreamer) {
-    logger.warning(`Overlay Streamer for camera #${cameraId} not found`)
+    logger.notice(
+      `Overlay Streamer for camera #${cameraId} not found. Camera will not be started yet.`
+    )
     return
   }
   if (!overlaySocektPort) {
-    logger.warning(`Overlay Socket Port for camera #${cameraId} not found`)
+    logger.notice(
+      `Overlay Socket Port for camera #${cameraId} not found. Camera will not be started yet.`
+    )
     return
   }
   logger.info(`Starting camera ${cameraId}`)
+  const { traits: cameraTraits } = camera.info
+  if (!cameraTraits || !cameraTraits['sdm.devices.traits.CameraLiveStream']) {
+    logger.warning(`Camera #${cameraId} is missing required traits to be started.`)
+    logger.notice(`Removing camera #${cameraId} from startable cameras.`)
+    await app.db('cameras').where('id', cameraId).update({
+      is_active: false,
+      is_ready: false,
+      child_process_id: null,
+    })
+  }
+  const cameraLiveStreamTraits = cameraTraits!['sdm.devices.traits.CameraLiveStream']
+  if (
+    !cameraLiveStreamTraits.supportedProtocols ||
+    !Array.isArray(cameraLiveStreamTraits.supportedProtocols) ||
+    cameraLiveStreamTraits.supportedProtocols.length === 0
+  ) {
+    logger.warning(`Camera #${cameraId} is missing required protocol information to be started.`)
+    logger.notice(`Removing camera #${cameraId} from startable cameras.`)
+    await app.db('cameras').where('id', cameraId).update({
+      is_active: false,
+      is_ready: false,
+      child_process_id: null,
+    })
+  }
+  const cameraSupportedProtocls = cameraLiveStreamTraits.supportedProtocols
+  const cameraProtocolToUse = cameraSupportedProtocls[0]
+  logger.debug(`Camera ${cameraId} is using protocol ${cameraProtocolToUse}`)
   // @todo: actually start the camera
+  console.log(camera)
   app.emit('camera:db:updated', cameraId)
 }
 
@@ -307,45 +351,6 @@ const stopCamera = async (app: ApplicationInterface, cameraId: number, logger: L
   logger.info(`Stopping camera ${cameraId}`)
   // @todo: actually stop the camera
   app.emit('camera:db:updated', cameraId)
-}
-
-/**
- * Ensure that a named pipe exists, or create it if it doesn't.
- */
-const ensureNamedPipe = async (
-  app: ApplicationInterface,
-  path: string,
-  refresh: boolean = false
-) => {
-  const exists = await fsExists(path, constants.F_OK | constants.W_OK)
-  if (!exists) {
-    const { execa } = app.execa
-    const dir = dirname(path)
-    const dirExists = await fsExists(dir, constants.F_OK | constants.W_OK)
-    if (!dirExists) {
-      const result = await execa('mkdir', ['-p', dir], {
-        reject: false,
-      })
-      if (result.failed) {
-        throw new Error(`Failed to create named pipe directory with error: ${result.stderr}`)
-      }
-    }
-    const result = await execa('mkfifo', [path], {
-      reject: false,
-    })
-    if (result.failed) {
-      throw new Error(`Failed to create named pipe with error: ${result.stderr}`)
-    }
-  } else if (refresh === true) {
-    const { execa } = app.execa
-    const result = await execa('rm', [path], {
-      reject: false,
-    })
-    if (result.failed) {
-      throw new Error(`Failed to remove named pipe with error: ${result.stderr}`)
-    }
-    await ensureNamedPipe(app, path)
-  }
 }
 
 export default useMonitoring

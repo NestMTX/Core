@@ -1,5 +1,16 @@
-import type { ApplicationInterface } from '../contracts/application'
+import type { ApplicationInterface, Camera } from '../contracts/application'
 import { access, constants } from 'fs/promises'
+
+export const safeJsonParse = (json: string | null | undefined, onFail: any = undefined) => {
+  if ('string' !== typeof json) {
+    return onFail
+  }
+  try {
+    return JSON.parse(json)
+  } catch {
+    return onFail
+  }
+}
 
 export const getCameras = async (app: ApplicationInterface) => {
   const tableExists = await app.db.schema.hasTable('cameras')
@@ -35,15 +46,24 @@ export const getCamera = async (app: ApplicationInterface, id: number) => {
   if (!fromDb) {
     return undefined
   }
+  const credentials = await app.db('credentials').where('id', fromDb.credential_id).first()
+  credentials.oauth_client_id = app.encryption.decrypt(credentials.oauth_client_id)
+  credentials.oauth_client_secret = app.encryption.decrypt(credentials.oauth_client_secret)
+  credentials.dac_project_id = app.encryption.decrypt(credentials.dac_project_id)
+  credentials.tokens = safeJsonParse(
+    safeJsonParse(app.encryption.decrypt(credentials.tokens), null),
+    null
+  )
   return {
     ...fromDb,
     is_active: !!fromDb.is_active,
     is_ready: !!fromDb.is_ready,
     is_demanded: !!fromDb.is_demanded,
     uid: fromDb.uid ? app.encryption.decrypt(fromDb.uid) : null,
-    info: fromDb.info ? app.encryption.decrypt(fromDb.info) : null,
-    stream_info: fromDb.info ? app.encryption.decrypt(fromDb.stream_info) : null,
-  }
+    info: fromDb.info ? safeJsonParse(app.encryption.decrypt(fromDb.info), null) : null,
+    stream_info: fromDb.info ? safeJsonParse(app.encryption.decrypt(fromDb.stream_info)) : null,
+    credentials,
+  } as Camera
 }
 
 export const fsExists = async (path: string, mode?: number) => {

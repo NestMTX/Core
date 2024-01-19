@@ -142,6 +142,14 @@ export class OverlayStreamer {
         this.#logger.debug(`Pushing buffer with size ${retPacket.length} to socket server`)
         this.#server.broadcast(retPacket)
       })
+      this.#process.stderr?.on('data', (chunk) => {
+        chunk
+          .toString()
+          .split('\n')
+          .forEach((line) => {
+            this.#logger.debug(line)
+          })
+      })
       this.#process
         .then(() => {
           this.#process = undefined
