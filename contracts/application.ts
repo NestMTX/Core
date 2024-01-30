@@ -8,7 +8,7 @@ import type Encryption from '../app/services/encryption'
 import type { ExecaModule } from '../app/esModules'
 import type { pickPort } from 'pick-port'
 import type { smartdevicemanagement_v1 } from 'googleapis'
-import type { GetTokenResponse } from 'google-auth-library/build/src/auth/oauth2client.d.ts'
+import type { Credentials as GoogleOauthTokens } from 'google-auth-library/build/src/auth/credentials.d.ts'
 
 export interface Overlays {
   initializing: Buffer
@@ -42,10 +42,36 @@ export interface Credentials {
   oauth_client_id: string | null
   oauth_client_secret: string | null
   dac_project_id: string | null
-  tokens: GetTokenResponse | null
+  tokens: GoogleOauthTokens | null
+  redirect_uri?: string | null
 }
 
-export interface Camera {
+export interface GoogleRTSPStreamInfo {
+  streamUrls: {
+    rtspUrl: string
+  }
+  streamExtensionToken: string
+  streamToken: string
+  expiresAt: string
+}
+
+export interface GoogleWebRTCStreamInfo {
+  answerSdp: string
+  streamToken: string
+  mediaSessionId: string
+}
+
+export interface RTSPStreamInfo extends GoogleRTSPStreamInfo {
+  redirectUri?: string
+}
+
+export interface WebRTCStreamInfo extends GoogleWebRTCStreamInfo {
+  redirectUri?: string
+}
+
+export type StreamInfo = RTSPStreamInfo | WebRTCStreamInfo
+
+export interface Camera<StreamInfoType = StreamInfo> {
   id: number
   credential_id: number
   uid: string
@@ -56,7 +82,7 @@ export interface Camera {
   mediamtx_path: string | null
   is_active: boolean
   is_ready: boolean
-  stream_info: any | null
+  stream_info: StreamInfoType | null
   child_process_id: number | null
   webrtc_ffmpeg_sdp: string | null
   webrtc_width: number | null
@@ -65,5 +91,5 @@ export interface Camera {
   webrtc_bitrate_k: number
   startup_mode: 'always_on' | 'on_demand' | 'never'
   is_demanded: boolean
-  credentials: Credentials
+  credentials: Credentials | null
 }

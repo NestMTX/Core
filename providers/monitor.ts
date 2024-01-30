@@ -1,11 +1,14 @@
 import make from '@nestmtx/pando-logger'
 import type { Logger } from 'winston'
 import { getCamera, getCameras } from '../app/utilities'
-import type { ApplicationInterface } from '../contracts/application'
+import type { ApplicationInterface, Camera, RTSPStreamInfo } from '../contracts/application'
 import type { ProviderInterface } from '../contracts/provider'
 import SocketServer from '../app/services/socket'
 import { pickPort } from 'pick-port'
 import { OverlayStreamer } from '../app/services/overlays'
+import type { ExecaChildProcess } from 'execa'
+import { UnrecognizedProtocolError, FFMpegProcessFailedToStartError } from '../app/errors'
+import startRtspCamera from '../app/services/rtsp'
 
 /**
  * The Monitoring Provider is responsible for managing the camera processes.
@@ -276,7 +279,7 @@ const startCamera = async (
   cameraId: number,
   logger: Logger,
   overlayStreamerPromise: Promise<OverlayStreamer | undefined>,
-  overlaySocektPort: number | undefined
+  overlaySocketPort: number | undefined
 ) => {
   logger.info(`Trying to start camera #${cameraId}`)
   const camera = await getCamera(app, cameraId)
@@ -294,10 +297,6 @@ const startCamera = async (
     })
     return
   }
-  if (camera.child_process_id !== null) {
-    logger.notice(`Camera #${cameraId} appears to have already been started.`)
-    return
-  }
   const overlayStreamer = await overlayStreamerPromise
   if (!overlayStreamer) {
     logger.notice(
@@ -305,7 +304,7 @@ const startCamera = async (
     )
     return
   }
-  if (!overlaySocektPort) {
+  if (!overlaySocketPort) {
     logger.notice(
       `Overlay Socket Port for camera #${cameraId} not found. Camera will not be started yet.`
     )
@@ -339,8 +338,81 @@ const startCamera = async (
   const cameraSupportedProtocls = cameraLiveStreamTraits.supportedProtocols
   const cameraProtocolToUse = cameraSupportedProtocls[0]
   logger.debug(`Camera ${cameraId} is using protocol ${cameraProtocolToUse}`)
-  // @todo: actually start the camera
-  console.log(camera)
+  let processFn: () => ExecaChildProcess | undefined
+  try {
+    switch (cameraProtocolToUse) {
+      case 'RTSP':
+        processFn = await startRtspCamera(app, camera as Camera<RTSPStreamInfo>)
+        break
+
+      default:
+        throw new UnrecognizedProtocolError(cameraProtocolToUse)
+    }
+  } catch (error) {
+    logger.error(`Failed to start camera ${cameraId}`)
+    if (!(error instanceof FFMpegProcessFailedToStartError)) {
+      logger.notice(`Removing camera #${cameraId} from startable cameras.`)
+      await app.db('cameras').where('id', cameraId).update({
+        is_active: false,
+        is_ready: false,
+        child_process_id: null,
+      })
+    }
+    return
+  }
+  if (!processFn) {
+    logger.error(`Failed to start camera ${cameraId}`)
+    logger.notice(`Removing camera #${cameraId} from startable cameras.`)
+    await app.db('cameras').where('id', cameraId).update({
+      is_active: false,
+      is_ready: false,
+      child_process_id: null,
+    })
+    return
+  }
+  const cameraProcess = processFn()
+  if (!cameraProcess) {
+    logger.error(`Failed to start camera ${cameraId}`)
+    await app.db('cameras').where('id', cameraId).update({
+      is_ready: false,
+      child_process_id: null,
+    })
+    return
+  }
+  cameraProcess
+    .then((res) => {
+      logger.info(`Camera ${cameraId} exited with code ${res.exitCode}`)
+      if (!res.isCanceled) {
+        app.db('cameras').where('id', cameraId).update({
+          is_ready: false,
+          child_process_id: null,
+        })
+      }
+      app.processes.delete(cameraId)
+      app.emit('camera:db:updated', cameraId)
+    })
+    .catch((error: any) => {
+      if (error instanceof Error) {
+        logger.error(`Camera ${cameraId} exited with error`)
+        logger.error(error)
+      }
+      if (error.stderr) {
+        logger.error(error.stderr)
+      }
+      if (error.shortMessage) {
+        logger.error(error.shortMessage)
+      }
+      app.db('cameras').where('id', cameraId).update({
+        is_ready: false,
+        child_process_id: null,
+      })
+      app.processes.delete(cameraId)
+    })
+  await app.db('cameras').where('id', cameraId).update({
+    is_ready: true,
+    child_process_id: cameraProcess.pid,
+  })
+  app.processes.set(cameraId, cameraProcess.pid!)
   app.emit('camera:db:updated', cameraId)
 }
 
